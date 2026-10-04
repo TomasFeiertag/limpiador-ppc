@@ -2,3 +2,4 @@ streamlit
 duckdb
 pandas
 openai
+google-genai

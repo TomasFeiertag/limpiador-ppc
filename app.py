@@ -4,10 +4,14 @@ import hashlib
 import json
 import os
 import tempfile
+from dataclasses import dataclass
 
 import duckdb
 import pandas as pd
 import streamlit as st
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 from openai import OpenAI, OpenAIError
 
 REQUIRED_COLUMNS = {"Campaign", "search_term", "cost", "conversions"}
@@ -42,8 +46,34 @@ LABEL_NEGATIVE = "Negativa Automática"
 LABEL_REVIEW = "A Revisar"
 
 OPENAI_MODEL = "gpt-4o-mini"
+# Activo y sin fecha de baja según ai.google.dev/gemini-api/docs/deprecations (2026-10).
+GEMINI_MODEL = "gemini-2.5-flash"
+AI_TIMEOUT_S = 60
 AI_LABELS = frozenset({"Basura", "Relevante"})
 AI_STATE_KEY = "ai_result"
+
+
+@dataclass(frozen=True)
+class AIProvider:
+    key_label: str
+    env_var: str
+    placeholder: str
+    help: str
+
+
+PROVIDER_OPENAI = "OpenAI (GPT-4o-mini)"
+PROVIDER_GEMINI = "Google Gemini (Gemini Flash)"
+AI_PROVIDERS = {
+    PROVIDER_OPENAI: AIProvider(
+        "OpenAI API Key", "OPENAI_API_KEY", "sk-...",
+        "Creala en https://platform.openai.com/api-keys (requiere crédito prepago).",
+    ),
+    PROVIDER_GEMINI: AIProvider(
+        "Google AI Studio API Key", "GEMINI_API_KEY", "AIza...",
+        "Gratis en https://aistudio.google.com/apikey (nivel gratuito con límite por minuto).",
+    ),
+}
+AI_ERRORS = (OpenAIError, genai_errors.APIError, json.JSONDecodeError)
 PROMPT_TEMPLATE = (
     "Sos un experto en Google Ads. El cliente vende: {contexto}. "
     "Evaluá esta lista de palabras de búsqueda que gastaron dinero sin generar ventas. "
@@ -120,30 +150,66 @@ def _validar_resultados(payload: object, esperadas: set[str]) -> dict[str, tuple
     return validos
 
 
-def _consultar_openai(palabras: list[str], contexto: str, api_key: str) -> dict[str, tuple[str, str]]:
-    prompt = PROMPT_TEMPLATE.format(contexto=contexto, lista_palabras=", ".join(palabras))
-    client = OpenAI(api_key=api_key, timeout=60)
+def _pedir_json_openai(prompt: str, api_key: str) -> str:
+    client = OpenAI(api_key=api_key, timeout=AI_TIMEOUT_S)
     response = client.chat.completions.create(
         model=OPENAI_MODEL,
         response_format={"type": "json_object"},
         temperature=0,
         messages=[{"role": "user", "content": prompt}],
     )
-    payload = json.loads(response.choices[0].message.content or "{}")
+    return response.choices[0].message.content or "{}"
+
+
+def _pedir_json_gemini(prompt: str, api_key: str) -> str:
+    client = genai.Client(api_key=api_key, http_options=genai_types.HttpOptions(timeout=AI_TIMEOUT_S * 1000))
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0,
+            automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
+        ),
+    )
+    return response.text or "{}"
+
+
+JSON_REQUESTERS = {PROVIDER_OPENAI: _pedir_json_openai, PROVIDER_GEMINI: _pedir_json_gemini}
+
+
+def _consultar_ia(palabras: list[str], contexto: str, api_key: str, proveedor: str) -> dict[str, tuple[str, str]]:
+    prompt = PROMPT_TEMPLATE.format(contexto=contexto, lista_palabras=", ".join(palabras))
+    payload = json.loads(JSON_REQUESTERS[proveedor](prompt, api_key))
     return _validar_resultados(payload, set(palabras))
 
 
-def analizar_con_ia(df: pd.DataFrame, contexto: str, api_key: str) -> pd.DataFrame:
-    """Reclasifica con OpenAI las palabras 'A Revisar' (devuelve un DataFrame nuevo)."""
+def mensaje_error_ia(exc: Exception) -> str:
+    """Traduce errores del proveedor a un mensaje útil sin exponer la key ni el detalle crudo."""
+    if isinstance(exc, json.JSONDecodeError):
+        return "La IA devolvió una respuesta que no es JSON válido. Reintentá."
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if status in (400, 401, 403):
+        return "API Key inválida o sin permisos para este proveedor. Revisala en la barra lateral."
+    if status == 429:
+        return "Límite de uso alcanzado (cuota o nivel gratuito). Esperá un minuto y reintentá."
+    return f"Falló el análisis con IA ({type(exc).__name__}). Reintentá en unos segundos."
+
+
+def analizar_con_ia(
+    df: pd.DataFrame, contexto: str, api_key: str, proveedor: str = PROVIDER_OPENAI
+) -> pd.DataFrame:
+    """Reclasifica con el proveedor elegido las palabras 'A Revisar' (devuelve un DataFrame nuevo)."""
     if not api_key or not contexto.strip():
-        st.warning("Ingresá tu OpenAI API Key en la barra lateral y el contexto de tu negocio.")
+        key_label = AI_PROVIDERS[proveedor].key_label
+        st.warning(f"Ingresá tu {key_label} en la barra lateral y el contexto de tu negocio.")
         return df
     dudosas = df.loc[df["Clasificacion"] == LABEL_REVIEW, "word"].tolist()
     if not dudosas:
         st.info("No hay palabras 'A Revisar' para analizar.")
         return df
 
-    resultados = _consultar_openai(dudosas, contexto.strip(), api_key)
+    resultados = _consultar_ia(dudosas, contexto.strip(), api_key, proveedor)
     sin_respuesta = len(dudosas) - len(resultados)
     if sin_respuesta:
         st.warning(f"La IA no devolvió una clasificación válida para {sin_respuesta} palabra(s); siguen 'A Revisar'.")
@@ -174,7 +240,12 @@ def main() -> None:
     st.set_page_config(page_title="Negative Keyword Finder", page_icon="🔎", layout="wide")
     st.title("🔎 Negative Keyword Finder")
     st.caption(f"Palabras con 0 conversiones y costo mayor a ${MIN_COST:.0f}")
-    api_key = st.sidebar.text_input("OpenAI API Key", type="password") or os.environ.get("OPENAI_API_KEY", "")
+    proveedor = st.sidebar.selectbox("Proveedor de IA", list(AI_PROVIDERS))
+    cfg = AI_PROVIDERS[proveedor]
+    # Un widget por proveedor: cambiar de proveedor no reutiliza la key del otro.
+    api_key = st.sidebar.text_input(
+        cfg.key_label, type="password", placeholder=cfg.placeholder, help=cfg.help, key=f"key_{cfg.env_var}"
+    ) or os.environ.get(cfg.env_var, "")
 
     uploaded = st.file_uploader("Subí el CSV de términos de búsqueda", type="csv")
     if uploaded is None:
@@ -196,10 +267,10 @@ def main() -> None:
     contexto = st.text_input("Contexto de tu negocio (¿Qué vendés o qué servicio ofrecés?)")
     if st.button("Analizar Dudosos con IA"):
         try:
-            with st.spinner("Consultando a OpenAI..."):
-                st.session_state[AI_STATE_KEY] = (file_key, analizar_con_ia(result, contexto, api_key))
-        except (OpenAIError, json.JSONDecodeError) as exc:
-            st.error(f"Falló el análisis con IA ({type(exc).__name__}). Revisá la API Key y reintentá.")
+            with st.spinner(f"Consultando a {proveedor}..."):
+                st.session_state[AI_STATE_KEY] = (file_key, analizar_con_ia(result, contexto, api_key, proveedor))
+        except AI_ERRORS as exc:
+            st.error(mensaje_error_ia(exc))
 
     cached = st.session_state.get(AI_STATE_KEY)
     _render_results(cached[1] if cached and cached[0] == file_key else result)
