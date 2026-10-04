@@ -1,0 +1,14 @@
+# Entornos virtuales
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Secretos
+.env
+.streamlit/secrets.toml
+
+# Datos de prueba
+terminos_mock.csv
