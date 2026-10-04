@@ -20,11 +20,23 @@ STOPWORDS_ES = frozenset({
     "esta", "esto", "ese", "esa", "son", "hay", "cual", "donde", "cuando",
 })
 
-# Patrones de basura B2B; se evalúan sobre la palabra completa.
-JUNK_PATTERNS = (
+# Patrones de basura B2B; se evalúan sobre la palabra completa (sin grupos de captura).
+JUNK_PATTERNS_ES = (
     r"gratis", r"gratuit[oa]s?", r"empleos?", r"trabajos?", r"barat[oa]s?",
     r"usad[oa]s?", r"cursos?", r"pdf", r"descargar?", r"tutorial(?:es)?",
 )
+JUNK_PATTERNS_EN = (
+    # Empleos / búsqueda de trabajo
+    r"jobs?", r"careers?", r"hiring", r"salar(?:y|ies)", r"pay(?:ing)?", r"internships?",
+    # Descargas / contenido gratuito
+    r"free(?:bies?)?", r"download(?:s|ing|able)?", r"pdfs", r"templates?",
+    r"tutorials?", r"courses?",
+    # Intención irrelevante: clientes existentes, quejas, research de precio bajo.
+    # "sign in" y "near me" se parten en palabras: se detectan por su token distintivo.
+    r"log-?ins?", r"sign-?in", r"support", r"tracking", r"refund(?:s|ed|ing)?",
+    r"scam(?:s|mers?)?", r"reviews?", r"near", r"cheap(?:er|est)?", r"used",
+)
+JUNK_PATTERNS = JUNK_PATTERNS_ES + JUNK_PATTERNS_EN
 JUNK_REGEX = rf"^(?:{'|'.join(JUNK_PATTERNS)})$"
 LABEL_NEGATIVE = "Negativa Automática"
 LABEL_REVIEW = "A Revisar"
