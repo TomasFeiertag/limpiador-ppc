@@ -12,3 +12,6 @@ __pycache__/
 
 # Datos de prueba
 terminos_mock.csv
+
+# Material de marketing (no público)
+marketing/
